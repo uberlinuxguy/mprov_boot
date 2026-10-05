@@ -1,0 +1,52 @@
+#!/bin/busybox sh
+# busybox init sysinit script: devices, modules, network, then local hooks.
+
+bb=/usr/bin/busybox
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+. /run/busybox-init/env
+
+$bb mkdir -p /dev/pts /dev/shm /dev/mqueue /sys/fs/cgroup
+$bb mount -t devpts -o nosuid,noexec,gid=5,mode=620,ptmxmode=000 devpts /dev/pts
+$bb mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /dev/shm
+$bb mount -t mqueue mqueue /dev/mqueue 2>/dev/null
+$bb mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup 2>/dev/null
+$bb ln -sfn /proc/self/fd /dev/fd
+$bb ln -sfn /proc/self/fd/0 /dev/stdin
+$bb ln -sfn /proc/self/fd/1 /dev/stdout
+$bb ln -sfn /proc/self/fd/2 /dev/stderr
+$bb mkdir -p /var/log
+$bb touch /var/log/wtmp /var/log/lastlog /run/utmp
+$bb hostname -F /etc/hostname 2>/dev/null
+$bb syslogd -C256
+$bb klogd
+
+# Kernel modules: hotplug via mdev (module loading only; devtmpfs makes the
+# nodes), then coldplug everything already present.  A few passes pick up
+# devices that appear once their bus driver is loaded.
+if [ -d "/lib/modules/$($bb uname -r)" ] && [ -x /usr/sbin/modprobe ]; then
+	$bb ln -sf $bb /run/busybox-init/mdev
+	echo /run/busybox-init/mdev > /proc/sys/kernel/hotplug
+	for pass in 1 2 3; do
+		$bb find /sys/devices -name modalias -exec $bb cat {} + 2>/dev/null |
+			$bb sort -u | $bb xargs -r /usr/sbin/modprobe -qab 2>/dev/null
+	done
+fi
+
+# Images built on a host that could not run target binaries configure dpkg here.
+[ -x /etc/busybox-init/firstboot ] && /etc/busybox-init/firstboot
+
+$bb ip link set lo up
+if [ "$BBINIT_NETWORK" = yes ]; then
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		[ -e "$d/device" ] || continue  # physical interfaces only
+		$bb ip link set "$n" up
+		$bb udhcpc -b -S -t 5 -T 2 -A 10 -i "$n" -p "/run/udhcpc.$n.pid" \
+			-s /etc/busybox-init/udhcpc.script -x "hostname:$($bb hostname)"
+	done
+fi
+
+# Local hooks: executable files in start.d run in lexical order.
+$bb run-parts /etc/busybox-init/start.d
+[ -x /etc/rc.local ] && /etc/rc.local
+exit 0

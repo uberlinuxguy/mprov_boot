@@ -1,0 +1,7 @@
+#!/bin/busybox sh
+# busybox init shutdown script.  init itself then TERM/KILLs everything.
+bb=/usr/bin/busybox
+for f in /etc/busybox-init/stop.d/*; do [ -x "$f" ] && "$f"; done
+for p in /run/udhcpc.*.pid; do [ -f "$p" ] && $bb kill -USR2 "$($bb cat "$p")"; done
+$bb swapoff -a 2>/dev/null
+$bb sync

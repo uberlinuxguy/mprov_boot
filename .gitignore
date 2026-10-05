@@ -1,0 +1,4 @@
+*.img
+*.vmlinuz
+*.part
+__pycache__/

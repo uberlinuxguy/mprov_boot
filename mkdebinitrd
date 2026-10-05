@@ -1,0 +1,1051 @@
+#!/usr/bin/env python3
+"""
+mkdebinitrd - build a Debian initramfs from scratch that boots with busybox init.
+
+The image is a complete (minbase-style) Debian userland: dpkg and apt work, so
+packages can be installed at runtime with apt-get.  Busybox provides PID 1
+(/init -> busybox init), early mounts, module coldplug and DHCP networking.
+
+No Debian tooling is needed on the build host: the Release/Packages indices are
+fetched and verified here, dependencies are resolved here, and .deb files are
+unpacked with the host's GNU tar.  Package configuration (maintainer scripts)
+runs in a chroot when the host can execute target binaries (same arch, or a
+qemu-user binfmt handler).  When it cannot, packages are registered as
+"unpacked" and configured by busybox init on boot.
+
+Requires: Linux, root, python3 >= 3.6, GNU tar, cpio, and the chosen compressor.
+"""
+
+import argparse
+import concurrent.futures
+import fnmatch
+import gzip
+import hashlib
+import lzma
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKEL = os.path.join(HERE, "skel")
+
+# uname -m / common spellings -> Debian architecture name
+ARCH_ALIASES = {
+    "x86_64": "amd64", "x86-64": "amd64", "amd64": "amd64",
+    "aarch64": "arm64", "arm64": "arm64",
+    "armv7l": "armhf", "armv7": "armhf", "armhf": "armhf",
+    "armel": "armel",
+    "i386": "i386", "i486": "i386", "i586": "i386", "i686": "i386",
+    "ppc64le": "ppc64el", "ppc64el": "ppc64el",
+    "riscv64": "riscv64",
+    "s390x": "s390x",
+    "mips64el": "mips64el",
+    "loong64": "loong64", "loongarch64": "loong64",
+}
+
+# Kernel metapackage for each architecture.
+KERNEL_PACKAGES = {
+    "amd64": "linux-image-amd64",
+    "arm64": "linux-image-arm64",
+    "armhf": "linux-image-armmp",
+    "armel": "linux-image-marvell",
+    "i386": "linux-image-686",
+    "ppc64el": "linux-image-powerpc64le",
+    "riscv64": "linux-image-riscv64",
+    "s390x": "linux-image-s390x",
+    "mips64el": "linux-image-5kc-malta",
+    "loong64": "linux-image-loong64",
+}
+
+# Debian arch -> name of qemu's binfmt.d entry (/usr/lib/binfmt.d/qemu-<name>.conf).
+QEMU_BINFMT = {
+    "amd64": "x86_64",
+    "arm64": "aarch64",
+    "armhf": "arm",
+    "armel": "arm",
+    "i386": "i386",
+    "ppc64el": "ppc64le",
+    "riscv64": "riscv64",
+    "s390x": "s390x",
+    "mips64el": "mips64el",
+    "loong64": "loongarch64",
+}
+
+BINFMT_DIR = "/proc/sys/fs/binfmt_misc"
+
+# Extra merged-/usr aliases beyond bin, sbin and lib (where the dynamic linker lives).
+EXTRA_LIB_DIRS = {
+    "amd64": ["lib64"],
+    "ppc64el": ["lib64"],
+    "mips64el": ["lib64"],
+    "loong64": ["lib64"],
+}
+
+# Packages added on top of Priority: required (debootstrap's "minbase" + our needs).
+BASE_PACKAGES = ["apt", "busybox-static", "kmod", "ca-certificates", "debian-archive-keyring"]
+
+# Installed first, in this order, before the bulk unpack (mirrors debootstrap).
+CORE_FIRST = ["base-passwd", "base-files"]
+
+# Things that only cost space in a RAM-resident image.  Also written into the
+# image as a dpkg path-exclude config so later apt-get installs stay small.
+DOC_EXCLUDES = [
+    ("exclude", "/usr/share/doc/*"),
+    ("include", "/usr/share/doc/*/copyright"),
+    ("exclude", "/usr/share/man/*"),
+    ("exclude", "/usr/share/info/*"),
+    ("exclude", "/usr/share/locale/*"),
+    ("include", "/usr/share/locale/locale.alias"),
+    ("exclude", "/usr/share/lintian/*"),
+    ("exclude", "/usr/share/linda/*"),
+]
+
+DEB_CHROOT_ENV = {
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME": "/root",
+    "LC_ALL": "C",
+    "LANG": "C",
+    "DEBIAN_FRONTEND": "noninteractive",
+    "DEBCONF_NONINTERACTIVE_SEEN": "true",
+    "TERM": "dumb",
+}
+
+# Device nodes shipped in the archive.  The kernel needs /dev/console in the
+# initramfs to give /init a stdin/stdout; the rest let maintainer scripts run
+# in the build chroot.  devtmpfs is mounted over /dev at boot.
+DEV_NODES = [
+    ("console", 0o600, 5, 1), ("null", 0o666, 1, 3), ("zero", 0o666, 1, 5),
+    ("full", 0o666, 1, 7), ("random", 0o666, 1, 8), ("urandom", 0o666, 1, 9),
+    ("tty", 0o666, 5, 0),
+]
+
+VERBOSE = False
+
+
+def log(msg):
+    print("[mkdebinitrd] " + msg, file=sys.stderr, flush=True)
+
+
+def debug(msg):
+    if VERBOSE:
+        log(msg)
+
+
+def die(msg):
+    log("error: " + msg)
+    sys.exit(1)
+
+
+def run(cmd, **kw):
+    debug("+ " + " ".join(cmd))
+    return subprocess.run(cmd, check=True, **kw)
+
+
+# --------------------------------------------------------------------------
+# Repository access
+# --------------------------------------------------------------------------
+
+def fetch(url, dest=None):
+    """Download url; return bytes, or write to dest and return None."""
+    debug("GET " + url)
+    req = urllib.request.Request(url, headers={"User-Agent": "mkdebinitrd/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        if dest is None:
+            return resp.read()
+        tmp = dest + ".part"
+        with open(tmp, "wb") as f:
+            shutil.copyfileobj(resp, f, 1 << 20)
+        os.replace(tmp, dest)
+    return None
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_deb822(text):
+    """Parse RFC822-style stanzas (Packages, Release, control files)."""
+    stanzas = []
+    cur = {}
+    key = None
+    for line in text.splitlines():
+        if not line.strip():
+            if cur:
+                stanzas.append(cur)
+            cur, key = {}, None
+        elif line[0] in " \t":
+            if key is not None:
+                cur[key] += "\n" + line
+        else:
+            key, _, val = line.partition(":")
+            cur[key] = val.strip()
+    if cur:
+        stanzas.append(cur)
+    return stanzas
+
+
+def strip_pgp(text):
+    """Return the signed payload of a clear-signed InRelease file."""
+    if not text.startswith("-----BEGIN PGP SIGNED MESSAGE-----"):
+        return text
+    body = text.split("\n\n", 1)[1]
+    body = body.split("\n-----BEGIN PGP SIGNATURE-----", 1)[0]
+    return "\n".join(l[2:] if l.startswith("- ") else l for l in body.splitlines())
+
+
+class Repo:
+    def __init__(self, mirror, suite, arch, components, keyring, workdir):
+        self.mirror = mirror.rstrip("/")
+        self.suite = suite
+        self.arch = arch
+        self.components = components
+        self.keyring = keyring
+        self.workdir = workdir
+        self.packages = {}      # name -> stanza
+        self.providers = {}     # virtual name -> [real names]
+        self.codename = suite
+
+    def load(self):
+        base = "%s/dists/%s" % (self.mirror, self.suite)
+        inrelease = os.path.join(self.workdir, "InRelease." + self.arch)
+        fetch(base + "/InRelease", inrelease)
+        if self.keyring:
+            try:
+                run(["gpgv", "--keyring", self.keyring, inrelease],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except FileNotFoundError:
+                die("gpgv not found but --keyring was given")
+            except subprocess.CalledProcessError as e:
+                die("InRelease signature check failed:\n" + e.stderr.decode(errors="replace"))
+            log("InRelease signature verified with " + self.keyring)
+        else:
+            log("warning: no keyring; InRelease signature NOT verified "
+                "(relying on transport security of %s)" % self.mirror)
+        with open(inrelease, encoding="utf-8") as f:
+            release = parse_deb822(strip_pgp(f.read()))[0]
+        self.codename = release.get("Codename", self.suite)
+        archs = release.get("Architectures", "").split()
+        if archs and self.arch not in archs:
+            die("architecture %s not in %s (available: %s)" % (self.arch, self.suite, " ".join(archs)))
+
+        sums = {}
+        for line in release.get("SHA256", "").splitlines():
+            parts = line.split()
+            if len(parts) == 3:
+                sums[parts[2]] = parts[0]
+
+        for comp in self.components:
+            got = False
+            for ext, opener in ((".xz", lzma.decompress), (".gz", gzip.decompress)):
+                rel = "%s/binary-%s/Packages%s" % (comp, self.arch, ext)
+                if rel not in sums:
+                    continue
+                data = fetch("%s/%s" % (base, rel))
+                if hashlib.sha256(data).hexdigest() != sums[rel]:
+                    die("checksum mismatch for " + rel)
+                self._add_index(opener(data).decode("utf-8"))
+                got = True
+                break
+            if not got:
+                die("no Packages index for component %s/%s" % (comp, self.arch))
+        log("loaded %d packages from %s (%s) [%s]"
+            % (len(self.packages), self.suite, self.codename, ",".join(self.components)))
+
+    def _add_index(self, text):
+        for p in parse_deb822(text):
+            name = p.get("Package")
+            if not name:
+                continue
+            self.packages[name] = p
+            for prov in split_deps(p.get("Provides", "")):
+                for alt in prov:
+                    self.providers.setdefault(alt, []).append(name)
+
+
+def split_deps(field):
+    """'a (>= 1) | b:any, c [amd64]' -> [['a', 'b'], ['c']] (versions ignored)."""
+    out = []
+    for clause in field.split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        alts = []
+        for alt in clause.split("|"):
+            alt = re.sub(r"\(.*?\)|\[.*?\]|<.*?>", "", alt).strip()
+            alt = alt.split(":")[0]
+            if alt:
+                alts.append(alt)
+        if alts:
+            out.append(alts)
+    return out
+
+
+PRIORITY_RANK = {"required": 0, "important": 1, "standard": 2, "optional": 3, "extra": 4}
+
+
+def resolve(repo, wanted, excluded):
+    """Close `wanted` over Depends/Pre-Depends.  Returns names in discovery order."""
+    selected = []
+    seen = set()
+    # Everything explicitly wanted counts as chosen from the start, so an
+    # alternative or virtual (e.g. "awk") resolves to it (mawk) when possible.
+    planned = {n for n in wanted if n in repo.packages}
+
+    def providers(name):
+        return sorted((p for p in repo.providers.get(name, []) if p not in excluded),
+                      key=lambda p: PRIORITY_RANK.get(repo.packages[p].get("Priority"), 9))
+
+    def pick(alts):
+        # Prefer something already chosen, then a real package, then a provider.
+        for a in alts:
+            for cand in [a] + repo.providers.get(a, []):
+                if cand in seen or cand in planned:
+                    return cand
+        for a in alts:
+            if a in repo.packages and a not in excluded:
+                return a
+        for a in alts:
+            for prov in providers(a):
+                return prov
+        return None
+
+    queue = list(wanted)
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        if name not in repo.packages:
+            prov = pick([name])
+            if prov is None:
+                die("package not found: " + name)
+            name = prov
+            if name in seen:
+                continue
+        seen.add(name)
+        selected.append(name)
+        p = repo.packages[name]
+        for clause in split_deps(p.get("Pre-Depends", "")) + split_deps(p.get("Depends", "")):
+            choice = pick(clause)
+            if choice is None:
+                log("warning: unsatisfiable dependency of %s: %s" % (name, " | ".join(clause)))
+            elif choice not in seen:
+                queue.append(choice)
+    return selected
+
+
+def download_all(repo, names, cachedir, jobs):
+    """Fetch .debs into cachedir (verified by SHA256).  Returns name -> path."""
+    os.makedirs(cachedir, exist_ok=True)
+    paths = {}
+    todo = []
+    for n in names:
+        p = repo.packages[n]
+        path = os.path.join(cachedir, os.path.basename(p["Filename"]))
+        paths[n] = path
+        if not (os.path.exists(path) and sha256_file(path) == p["SHA256"]):
+            todo.append((n, p, path))
+    total = sum(int(p.get("Size", 0)) for _, p, _ in todo)
+    log("downloading %d of %d packages (%.1f MiB)" % (len(todo), len(names), total / 2**20))
+
+    def one(item):
+        n, p, path = item
+        for attempt in range(3):
+            try:
+                fetch("%s/%s" % (repo.mirror, p["Filename"]), path)
+                if sha256_file(path) == p["SHA256"]:
+                    return
+                log("checksum mismatch for %s, retrying" % n)
+            except Exception as e:  # network hiccups: retry
+                log("download of %s failed (%s), retrying" % (n, e))
+        die("could not download " + n)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+        list(ex.map(one, todo))
+    return paths
+
+
+# --------------------------------------------------------------------------
+# .deb handling
+# --------------------------------------------------------------------------
+
+def ar_members(path):
+    """Yield (name, bytes) for each member of an ar archive (.deb)."""
+    with open(path, "rb") as f:
+        if f.read(8) != b"!<arch>\n":
+            die("not a deb (bad ar magic): " + path)
+        while True:
+            hdr = f.read(60)
+            if len(hdr) < 60:
+                return
+            name = hdr[0:16].decode().strip().rstrip("/")
+            size = int(hdr[48:58].decode().strip())
+            data = f.read(size)
+            if size % 2:
+                f.read(1)
+            yield name, data
+
+
+class Deb:
+    def __init__(self, path):
+        self.path = path
+        self.control_tar = None
+        self.data_tar = None
+        for name, data in ar_members(path):
+            if name.startswith("control.tar"):
+                self.control_tar = (name, data)
+            elif name.startswith("data.tar"):
+                self.data_tar = (name, data)
+        if not self.control_tar or not self.data_tar:
+            die("malformed deb: " + path)
+
+    def _tar(self, member, args, tmpdir, **kw):
+        name, data = member
+        tmp = os.path.join(tmpdir, name)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        try:
+            return run(["tar"] + args + ["-f", tmp], **kw)
+        finally:
+            os.unlink(tmp)
+
+    def extract_data(self, root, tmpdir, members=()):
+        # --keep-directory-symlink: don't replace the merged-/usr symlinks.
+        self._tar(self.data_tar, ["-x", "--keep-directory-symlink", "--numeric-owner",
+                                  "-p", "-C", root] + list(members), tmpdir)
+
+    def list_data(self, tmpdir):
+        out = self._tar(self.data_tar, ["-t"], tmpdir, stdout=subprocess.PIPE).stdout
+        return out.decode("utf-8", "surrogateescape").splitlines()
+
+    def extract_control(self, dest, tmpdir):
+        os.makedirs(dest, exist_ok=True)
+        self._tar(self.control_tar, ["-x", "-C", dest], tmpdir)
+
+
+# --------------------------------------------------------------------------
+# Image construction
+# --------------------------------------------------------------------------
+
+class QemuUnavailable(Exception):
+    pass
+
+
+class Builder:
+    def __init__(self, args):
+        self.a = args
+        self.root = args.rootfs
+        self.tmp = tempfile.mkdtemp(prefix="mkdebinitrd.")
+        self.mounts = []
+        self.exec_mode = False
+        self.binfmt = None      # temporary binfmt_misc entry we registered
+
+    # -- helpers ----------------------------------------------------------
+
+    def path(self, *parts):
+        return os.path.join(self.root, *[p.lstrip("/") for p in parts])
+
+    def write(self, rel, content, mode=0o644):
+        p = self.path(rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(content)
+        os.chmod(p, mode)
+
+    def chroot(self, *cmd, check=True):
+        debug("chroot+ " + " ".join(cmd))
+        return subprocess.run(["chroot", self.root] + list(cmd), env=DEB_CHROOT_ENV,
+                              check=check)
+
+    def mount_chroot_fs(self):
+        for fstype, target in (("proc", "proc"), ("sysfs", "sys")):
+            t = self.path(target)
+            os.makedirs(t, exist_ok=True)
+            run(["mount", "-t", fstype, fstype, t])
+            self.mounts.append(t)
+
+    def umount_all(self):
+        for t in reversed(self.mounts):
+            subprocess.run(["umount", "-l", t])
+        self.mounts = []
+
+    def cleanup(self):
+        self.umount_all()
+        self.unregister_qemu()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- steps ------------------------------------------------------------
+
+    def prepare_root(self):
+        if os.path.exists(self.root):
+            if os.listdir(self.root) and not self.a.force:
+                die("rootfs directory %s is not empty (use --force)" % self.root)
+            shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        # Merged /usr, as debootstrap does for current Debian releases.
+        for d in ["bin", "sbin", "lib"] + EXTRA_LIB_DIRS.get(self.a.arch, []):
+            os.makedirs(self.path("usr", d), exist_ok=True)
+            os.symlink("usr/" + d, self.path(d))
+        for d in ("dev", "proc", "sys", "run", "tmp", "root", "etc/dpkg/dpkg.cfg.d",
+                  "var/lib/dpkg/info", "var/lib/dpkg/updates", "var/lib/dpkg/triggers",
+                  "var/lib/dpkg/alternatives"):
+            os.makedirs(self.path(d), exist_ok=True)
+        os.chmod(self.path("tmp"), 0o1777)
+        os.chmod(self.path("root"), 0o700)
+        for name, mode, major, minor in DEV_NODES:
+            os.mknod(self.path("dev", name), mode | stat.S_IFCHR, os.makedev(major, minor))
+            os.chmod(self.path("dev", name), mode)  # mknod honours the umask
+        for f in ("status", "available"):
+            open(self.path("var/lib/dpkg", f), "w").close()
+        with open(self.path("var/lib/dpkg/arch"), "w") as f:
+            f.write(self.a.arch + "\n")
+        if not self.a.keep_docs:
+            lines = ["# Written by mkdebinitrd: keep the RAM-resident image small."]
+            lines += ["path-%s %s" % kv for kv in DOC_EXCLUDES]
+            self.write("etc/dpkg/dpkg.cfg.d/01-mkdebinitrd-nodoc", "\n".join(lines) + "\n")
+
+    def can_exec(self):
+        """True if target binaries run on this host (native or binfmt/qemu)."""
+        if self.a.no_exec:
+            return False
+        if self.a.qemu:
+            dest = self.path(self.a.qemu)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(self.a.qemu, dest)
+        if self.chroot_works():
+            return True
+        if self.a.no_qemu_download or self.a.qemu:
+            return False
+        try:
+            self.register_qemu()
+        except QemuUnavailable as e:
+            log("warning: cannot set up qemu-user emulation: %s" % e)
+            return False
+        return self.chroot_works()
+
+    def chroot_works(self):
+        try:
+            r = subprocess.run(["chroot", self.root, "/usr/bin/true"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return r.returncode == 0
+        except OSError:
+            return False
+
+    def register_qemu(self):
+        """Fetch Debian's static qemu-user for the host and register it with
+        binfmt_misc for the duration of the build.
+
+        The entry uses the magic/mask qemu-user ships for binfmt.d plus the F flag,
+        so the kernel opens the emulator now and it needn't exist in the chroot.
+        binfmt_misc is host-wide: the entry is removed again in cleanup().
+        """
+        a = self.a
+        name = QEMU_BINFMT.get(a.arch)
+        host = ARCH_ALIASES.get(os.uname().machine)
+        if not name or not host:
+            raise QemuUnavailable("no qemu mapping for %s on %s" % (a.arch, os.uname().machine))
+        if not os.path.exists(os.path.join(BINFMT_DIR, "register")):
+            subprocess.run(["mount", "-t", "binfmt_misc", "binfmt_misc", BINFMT_DIR],
+                           stderr=subprocess.DEVNULL)
+            if not os.path.exists(os.path.join(BINFMT_DIR, "register")):
+                raise QemuUnavailable("binfmt_misc is not available on this host")
+
+        log("fetching qemu-user (%s) to emulate %s" % (host, a.arch))
+        hrepo = Repo(a.mirror, a.suite, host, ["main"], a.keyring, self.tmp)
+        hrepo.load()
+        if "qemu-user" not in hrepo.packages:
+            raise QemuUnavailable("qemu-user not in %s for %s" % (a.suite, host))
+        version = hrepo.packages["qemu-user"]["Version"].replace(":", "_")
+        qdir = os.path.join(a.cache_dir, "qemu", "%s_%s" % (version, host))
+        conf = os.path.join(qdir, "usr/share/qemu/binfmt.d/qemu-%s.conf" % name)
+        if not os.path.exists(conf):
+            debs = download_all(hrepo, ["qemu-user"], a.cache_dir, a.jobs)
+            os.makedirs(qdir, exist_ok=True)
+            members = ["./usr/bin/qemu-" + name, "./usr/libexec/qemu-binfmt/%s-binfmt-P" % name,
+                       "./" + os.path.relpath(conf, qdir)]
+            try:
+                Deb(debs["qemu-user"]).extract_data(qdir, self.tmp, members)
+            except subprocess.CalledProcessError:
+                shutil.rmtree(qdir, ignore_errors=True)
+                raise QemuUnavailable("qemu-user has no emulator for " + name)
+
+        # :name:type:offset:magic:mask:interpreter:flags, as shipped by Debian.
+        with open(conf) as f:
+            fields = f.read().strip().split(":")
+        if len(fields) != 8:
+            raise QemuUnavailable("unexpected binfmt.d format in " + conf)
+        interp = os.path.join(qdir, fields[6].lstrip("/"))
+        flags = fields[7] if "F" in fields[7] else fields[7] + "F"
+        entry = "mkdebinitrd-%d-%s" % (os.getpid(), name)
+        fields[1], fields[6], fields[7] = entry, interp, flags
+        with open(os.path.join(BINFMT_DIR, "register"), "w") as f:
+            f.write(":".join(fields))
+        self.binfmt = os.path.join(BINFMT_DIR, entry)
+        log("registered temporary binfmt handler %s -> %s" % (entry, interp))
+
+    def unregister_qemu(self):
+        if self.binfmt and os.path.exists(self.binfmt):
+            with open(self.binfmt, "w") as f:
+                f.write("-1")
+            log("removed binfmt handler " + os.path.basename(self.binfmt))
+        self.binfmt = None
+
+    def install_packages(self, repo, names, debs):
+        log("unpacking %d packages" % len(names))
+        parsed = {}
+        for n in names:
+            parsed[n] = Deb(debs[n])
+            parsed[n].extract_data(self.root, self.tmp)
+
+        self.exec_mode = self.can_exec()
+        order = [n for n in CORE_FIRST if n in names] + [n for n in names if n not in CORE_FIRST]
+        if self.exec_mode:
+            self.configure_in_chroot(order, debs)
+        else:
+            log("target binaries cannot run on this host; packages will be "
+                "configured by busybox init at every boot")
+            self.register_unpacked(repo, order, parsed)
+
+    def configure_in_chroot(self, order, debs):
+        log("configuring packages in chroot")
+        self.write("usr/sbin/policy-rc.d", "#!/bin/sh\nexit 101\n", 0o755)
+        debdir = self.path("var/cache/apt/archives/mkdebinitrd")
+        os.makedirs(debdir, exist_ok=True)
+        rel = {}
+        for n in order:
+            dst = os.path.join(debdir, os.path.basename(debs[n]))
+            try:
+                os.link(debs[n], dst)
+            except OSError:
+                shutil.copy(debs[n], dst)
+            rel[n] = "/" + os.path.relpath(dst, self.root)
+        self.mount_chroot_fs()
+        try:
+            dpkg = ["dpkg", "--force-depends", "--force-confold", "--force-unsafe-io"]
+            for n in CORE_FIRST:
+                if n in rel:
+                    self.chroot(*(dpkg + ["--install", rel[n]]))
+            rest = [rel[n] for n in order if n not in CORE_FIRST]
+            self.chroot(*(dpkg + ["--force-overwrite", "--unpack"] + rest))
+            self.chroot("dpkg", "--configure", "-a", "--force-depends",
+                        "--force-configure-any", "--force-confold")
+            # Second pass catches anything left half-configured by ordering.
+            self.chroot("dpkg", "--configure", "-a", "--force-confold")
+            if self.a.root_password_hash:
+                self.chroot("usermod", "-p", self.a.root_password_hash, "root")
+        finally:
+            self.umount_all()
+            shutil.rmtree(debdir, ignore_errors=True)
+            os.unlink(self.path("usr/sbin/policy-rc.d"))
+
+    def register_unpacked(self, repo, order, parsed):
+        """Write the dpkg database as if `dpkg --unpack` had run, for configure at boot."""
+        status = []
+        preinsts = []
+        for n in order:
+            deb = parsed[n]
+            ctl = os.path.join(self.tmp, "ctl-" + n)
+            deb.extract_control(ctl, self.tmp)
+            with open(os.path.join(ctl, "control"), encoding="utf-8") as f:
+                control = f.read().rstrip("\n")
+            fields = parse_deb822(control)[0]
+            arch = fields.get("Architecture", "all")
+            infoname = n + (":" + arch if fields.get("Multi-Arch") == "same" else "")
+            info = self.path("var/lib/dpkg/info")
+
+            conffiles = []
+            cpath = os.path.join(ctl, "conffiles")
+            if os.path.exists(cpath):
+                with open(cpath) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("remove-on-upgrade "):
+                            continue
+                        if line:
+                            conffiles.append(line)
+            # Mimic dpkg: new conffiles sit at <file>.dpkg-new until configure.
+            for cf in conffiles:
+                p = self.path(cf)
+                if os.path.lexists(p):
+                    os.rename(p, p + ".dpkg-new")
+
+            with open(os.path.join(info, infoname + ".list"), "w",
+                      encoding="utf-8", errors="surrogateescape") as f:
+                for entry in deb.list_data(self.tmp):
+                    e = entry[1:] if entry.startswith(".") else entry
+                    e = e.rstrip("/") or "/."
+                    f.write(e + "\n")
+            for member in os.listdir(ctl):
+                if member == "control":
+                    continue
+                dst = os.path.join(info, infoname + "." + member)
+                shutil.copy2(os.path.join(ctl, member), dst)
+                if member == "preinst":
+                    preinsts.append((n, arch, dst[len(self.root):]))
+            shutil.rmtree(ctl)
+
+            lines = control.split("\n")
+            lines.insert(1, "Status: install ok unpacked")
+            if conffiles:
+                lines.append("Conffiles:")
+                lines += [" %s newconffile" % cf for cf in conffiles]
+            status.append("\n".join(lines))
+        with open(self.path("var/lib/dpkg/status"), "w", encoding="utf-8") as f:
+            f.write("\n\n".join(status) + "\n")
+        # Info db format 1: Multi-Arch: same files are named <pkg>:<arch>.*
+        with open(self.path("var/lib/dpkg/info/format"), "w") as f:
+            f.write("1\n")
+
+        script = ["#!/bin/sh",
+                  "# Generated by mkdebinitrd: this image was built on a host that",
+                  "# could not run %s binaries, so dpkg configuration runs at boot." % self.a.arch,
+                  "export " + " ".join("%s='%s'" % kv for kv in DEB_CHROOT_ENV.items()),
+                  "echo 'mkdebinitrd: configuring packages (first boot of this image)...'",
+                  "printf '#!/bin/sh\\nexit 101\\n' > /usr/sbin/policy-rc.d",
+                  "chmod 755 /usr/sbin/policy-rc.d"]
+        # dpkg-maintscript-helper needs the environment dpkg would provide.
+        script += ["[ -x %s ] && DPKG_MAINTSCRIPT_PACKAGE=%s DPKG_MAINTSCRIPT_ARCH=%s "
+                   "DPKG_MAINTSCRIPT_NAME=preinst DPKG_MAINTSCRIPT_PACKAGE_REFCOUNT=1 "
+                   "DPKG_ROOT= %s install" % (p, n, ar, p) for n, ar, p in preinsts]
+        script += ["dpkg --configure -a --force-depends --force-configure-any --force-confold",
+                   "dpkg --configure -a --force-confold"]
+        if self.a.root_password_hash:
+            script.append("usermod -p '%s' root" % self.a.root_password_hash)
+        script += ["rm -f /usr/sbin/policy-rc.d /var/cache/apt/*.bin", ""]
+        self.write("etc/busybox-init/firstboot", "\n".join(script), 0o755)
+
+    def install_kernel(self, repo, kernel_names, debs):
+        """Unpack the kernel outside dpkg (no initramfs-tools), export vmlinuz."""
+        if not kernel_names:
+            return
+        log("installing kernel: " + " ".join(kernel_names))
+        for n in kernel_names:
+            Deb(debs[n]).extract_data(self.root, self.tmp)
+        boot = self.path("boot")
+        kernels = sorted(f for f in os.listdir(boot) if re.match(r"(vmlinu[xz]|Image)-", f))
+        if not kernels:
+            die("kernel package did not contain a kernel image in /boot")
+        kimg = kernels[-1]
+        kver = kimg.split("-", 1)[1]
+        out = self.a.kernel_output or os.path.splitext(self.a.output)[0] + ".vmlinuz"
+        shutil.copy2(os.path.join(boot, kimg), out)
+        log("kernel %s -> %s" % (kver, out))
+        # The kernel, System.map etc. are useless inside the initramfs.
+        shutil.rmtree(boot)
+        os.makedirs(boot)
+        moddir = self.path("usr/lib/modules", kver)
+        for pattern in self.a.exclude_modules:
+            target = os.path.join(moddir, "kernel", pattern.strip("/"))
+            if os.path.exists(target):
+                debug("dropping modules: " + target)
+                shutil.rmtree(target)
+        if self.exec_mode:
+            self.chroot("depmod", "-a", kver)
+        else:
+            run(["depmod", "-a", "-b", self.root, kver])
+
+    def configure_image(self, repo):
+        a = self.a
+        codename = repo.codename
+        # apt sources: same mirror the image was built from, plus updates/security.
+        signed_by = "/usr/share/keyrings/debian-archive-keyring.gpg"
+        comps = " ".join(a.components)
+        suites = codename
+        security = None
+        if codename not in ("sid", "unstable", "experimental"):
+            suites += " %s-updates" % codename
+            security = a.security_mirror
+        src = ("Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nSigned-By: %s\n"
+               % (a.mirror, suites, comps, signed_by))
+        if security:
+            src += ("\nTypes: deb\nURIs: %s\nSuites: %s-security\nComponents: %s\nSigned-By: %s\n"
+                    % (security, codename, comps, signed_by))
+        self.write("etc/apt/sources.list.d/debian.sources", src)
+        if os.path.exists(self.path("etc/apt/sources.list")):
+            os.unlink(self.path("etc/apt/sources.list"))
+
+        apt_conf = [
+            "// Written by mkdebinitrd: this system lives in RAM, keep it lean.",
+            'Acquire::Languages "none";',
+            'Acquire::GzipIndexes "true";',
+            'Acquire::CompressionTypes::Order:: "gz";',
+            'DPkg::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb '
+            '/var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };',
+            'APT::Update::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb '
+            '/var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };',
+            'Dir::Cache::pkgcache "";',
+            'Dir::Cache::srcpkgcache "";',
+        ]
+        if not a.apt_recommends:
+            apt_conf += ['APT::Install-Recommends "false";', 'APT::Install-Suggests "false";']
+        self.write("etc/apt/apt.conf.d/90mkdebinitrd", "\n".join(apt_conf) + "\n")
+
+        self.write("etc/hostname", a.hostname + "\n")
+        self.write("etc/hosts", "127.0.0.1\tlocalhost\n127.0.1.1\t%s\n"
+                   "::1\t\tlocalhost ip6-localhost ip6-loopback\n" % a.hostname)
+        self.write("etc/fstab", "# The root filesystem is the initramfs (rootfs/tmpfs).\n")
+        if not os.path.lexists(self.path("etc/resolv.conf")):
+            self.write("etc/resolv.conf", "")
+        # Busybox init and its scripts.
+        for dirpath, _, files in os.walk(SKEL):
+            for fn in files:
+                src = os.path.join(dirpath, fn)
+                rel = os.path.relpath(src, SKEL)
+                dst = self.path(rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+        settings = ["BBINIT_AUTOLOGIN=%s" % ("no" if a.root_password_hash else "yes"),
+                    "BBINIT_NETWORK=%s" % ("no" if a.no_network else "yes")]
+        self.write("etc/busybox-init/settings", "\n".join(settings) + "\n")
+        bb = self.path("usr/bin/busybox")
+        if not os.path.exists(bb):
+            die("busybox binary missing from image")
+        if not os.path.lexists(self.path("usr/sbin/init")):
+            os.symlink("../bin/busybox", self.path("usr/sbin/init"))
+        # Put customizations in place last so they override package files.
+        for overlay in a.overlay:
+            log("copying overlay " + overlay)
+            run(["cp", "-a", "--no-preserve=ownership", overlay.rstrip("/") + "/.", self.root])
+
+    def trim(self):
+        log("trimming image")
+        rm = []
+        for sub in ("var/cache/apt", "var/lib/apt/lists", "var/log", "tmp", "var/tmp"):
+            d = self.path(sub)
+            if os.path.isdir(d):
+                for e in os.listdir(d):
+                    rm.append(os.path.join(d, e))
+        for p in rm:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+        for d in ("var/lib/apt/lists/partial", "var/cache/apt/archives/partial", "var/log"):
+            os.makedirs(self.path(d), exist_ok=True)
+        if self.a.keep_docs:
+            return
+        excludes = [(k, pat.lstrip("/")) for k, pat in DOC_EXCLUDES]
+        for top in ("usr/share/doc", "usr/share/man", "usr/share/info", "usr/share/locale",
+                    "usr/share/lintian", "usr/share/linda"):
+            base = self.path(top)
+            if not os.path.isdir(base):
+                continue
+            for dirpath, dirs, files in os.walk(base, topdown=False):
+                for fn in files + [d for d in dirs if os.path.islink(os.path.join(dirpath, d))]:
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, self.root)
+                    keep = True
+                    for kind, pat in excludes:
+                        if fnmatch.fnmatch(rel, pat):
+                            keep = kind == "include"
+                    if not keep:
+                        os.unlink(full)
+                for d in dirs:
+                    full = os.path.join(dirpath, d)
+                    if os.path.isdir(full) and not os.path.islink(full) and not os.listdir(full):
+                        os.rmdir(full)
+
+    def make_cpio(self):
+        log("creating %s (%s)" % (self.a.output, self.a.compression))
+        comp = {
+            "zstd": ["zstd", "-q", "-19", "-T0", "-c"],
+            "xz": ["xz", "-T0", "-9", "--check=crc32", "-c"],  # kernel needs crc32
+            "gzip": ["gzip", "-9", "-n", "-c"],
+            "none": ["cat"],
+        }[self.a.compression]
+        tmp = self.a.output + ".part"
+        find = subprocess.Popen(["find", ".", "-mindepth", "1", "-print0"], cwd=self.root,
+                                stdout=subprocess.PIPE)
+        sort = subprocess.Popen(["sort", "-z"], stdin=find.stdout, stdout=subprocess.PIPE,
+                                env=dict(os.environ, LC_ALL="C"))
+        cpio = subprocess.Popen(["cpio", "--null", "--quiet", "-o", "-H", "newc",
+                                 "--reproducible"],
+                                cwd=self.root, stdin=sort.stdout, stdout=subprocess.PIPE)
+        with open(tmp, "wb") as out:
+            z = subprocess.Popen(comp, stdin=cpio.stdout, stdout=out)
+            find.stdout.close()
+            sort.stdout.close()
+            cpio.stdout.close()
+            for p in (find, sort, cpio, z):
+                if p.wait() != 0:
+                    die("archive creation failed (%s)" % p.args[0])
+        os.replace(tmp, self.a.output)
+
+
+def du(path):
+    total = 0
+    seen = set()
+    for dirpath, dirs, files in os.walk(path):
+        for fn in files + dirs:
+            st = os.lstat(os.path.join(dirpath, fn))
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            total += st.st_size
+    return total
+
+
+def hash_password(pw):
+    try:
+        import crypt  # removed in Python 3.13
+        return crypt.crypt(pw, crypt.mksalt(crypt.METHOD_SHA512))
+    except ImportError:
+        r = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=pw.encode(),
+                           stdout=subprocess.PIPE, check=True)
+        return r.stdout.decode().strip()
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KMGT]?)i?B?", s.strip(), re.I)
+    if not m:
+        raise argparse.ArgumentTypeError("bad size: " + s)
+    return int(float(m.group(1)) * 1024 ** " KMGT".index(m.group(2).upper() or " "))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Build a Debian initramfs from scratch that boots with busybox init "
+                    "and keeps a working apt/dpkg.")
+    ap.add_argument("arch", help="target CPU architecture (Debian name like amd64/arm64, "
+                                 "or uname -m style like x86_64/aarch64)")
+    ap.add_argument("-o", "--output", help="output initramfs (default: initramfs-<suite>-<arch>.img)")
+    ap.add_argument("-s", "--suite", default="trixie", help="Debian suite/codename (default: trixie)")
+    ap.add_argument("-m", "--mirror", default="https://deb.debian.org/debian")
+    ap.add_argument("--security-mirror", default="https://security.debian.org/debian-security",
+                    help="security mirror written into the image's apt sources")
+    ap.add_argument("-c", "--components", default="main",
+                    help="comma-separated components (e.g. main,non-free-firmware)")
+    ap.add_argument("-i", "--include", action="append", default=[],
+                    help="extra packages, comma separated (repeatable)")
+    ap.add_argument("-x", "--exclude", action="append", default=[],
+                    help="packages never to choose when resolving alternatives/virtuals")
+    ap.add_argument("--no-kernel", action="store_true",
+                    help="don't add a kernel and modules (bring your own kernel)")
+    ap.add_argument("--kernel-package", help="kernel package (default depends on arch)")
+    ap.add_argument("--kernel-output", help="where to write the kernel (default: <output minus extension>.vmlinuz)")
+    ap.add_argument("--exclude-modules", action="append", default=[],
+                    help="module subtrees under kernel/ to drop, e.g. sound,drivers/gpu")
+    ap.add_argument("--hostname", default="debian")
+    ap.add_argument("--root-password",
+                    help="set a root password and use a login prompt (default: autologin root shell)")
+    ap.add_argument("--no-network", action="store_true", help="don't run DHCP at boot")
+    ap.add_argument("--apt-recommends", action="store_true",
+                    help="let apt install Recommends at runtime (default: off, to save RAM)")
+    ap.add_argument("--keep-docs", action="store_true", help="keep man pages, docs and locales")
+    ap.add_argument("--overlay", action="append", default=[],
+                    help="directory copied over the image root at the end (repeatable)")
+    ap.add_argument("-C", "--compression", choices=["zstd", "xz", "gzip", "none"], default="zstd")
+    ap.add_argument("--max-size", type=parse_size, default=parse_size("2G"),
+                    help="fail if the compressed image exceeds this (default: 2G)")
+    ap.add_argument("--keyring", help="keyring for verifying InRelease with gpgv "
+                                      "(default: host's debian-archive-keyring if present)")
+    ap.add_argument("--qemu", help="static qemu-user binary to copy into the build chroot "
+                                   "(for binfmt handlers registered without the F flag)")
+    ap.add_argument("--no-exec", action="store_true",
+                    help="never run target binaries at build time (configure at boot)")
+    ap.add_argument("--no-qemu-download", action="store_true",
+                    help="for foreign architectures, don't fetch Debian's qemu-user and "
+                         "register a temporary binfmt handler; configure at boot instead")
+    ap.add_argument("--cache-dir", default=os.path.expanduser("~/.cache/mkdebinitrd"),
+                    help="where downloaded .debs are kept")
+    ap.add_argument("--rootfs", help="staging directory (default: a temp dir, removed afterwards)")
+    ap.add_argument("--keep-rootfs", action="store_true", help="don't delete the staging directory")
+    ap.add_argument("-f", "--force", action="store_true", help="overwrite a non-empty --rootfs")
+    ap.add_argument("-j", "--jobs", type=int, default=8, help="parallel downloads")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args()
+
+    global VERBOSE
+    VERBOSE = a.verbose
+    # Unwind through the finally blocks (umounts, binfmt entry) when killed.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda n, f: sys.exit(128 + n))
+    if os.geteuid() != 0:
+        die("must run as root (needs chroot, mknod and root-owned files)")
+    arch = ARCH_ALIASES.get(a.arch.lower())
+    if not arch:
+        die("unknown architecture %r (known: %s)" % (a.arch, ", ".join(sorted(set(ARCH_ALIASES.values())))))
+    a.arch = arch
+    a.components = [c for c in a.components.split(",") if c]
+    a.output = os.path.abspath(a.output or "initramfs-%s-%s.img" % (a.suite, arch))
+    os.makedirs(os.path.dirname(a.output), exist_ok=True)
+    a.exclude_modules = [m for v in a.exclude_modules for m in v.split(",") if m]
+    a.root_password_hash = hash_password(a.root_password) if a.root_password else None
+    if a.keyring is None:
+        for k in ("/usr/share/keyrings/debian-archive-keyring.gpg",
+                  "/usr/share/keyrings/debian-archive-keyring.pgp"):
+            if os.path.exists(k) and shutil.which("gpgv"):
+                a.keyring = k
+                break
+    for tool in ("tar", "cpio", "chroot", "find", "sort") + (
+            () if a.compression == "none" else (a.compression,)):
+        if not shutil.which(tool):
+            die("required host tool missing: " + tool)
+
+    keep_root = a.keep_rootfs or a.rootfs is not None
+    a.rootfs = os.path.abspath(a.rootfs or tempfile.mkdtemp(prefix="mkdebinitrd-root."))
+    if not a.rootfs or a.rootfs == "/":
+        die("refusing to use / as rootfs")
+
+    b = Builder(a)
+    try:
+        repo = Repo(a.mirror, a.suite, arch, a.components, a.keyring, b.tmp)
+        repo.load()
+
+        excluded = {p for v in a.exclude for p in v.split(",") if p}
+        wanted = [n for n, p in repo.packages.items()
+                  if p.get("Priority") == "required" or p.get("Essential") == "yes"]
+        wanted += BASE_PACKAGES + [p for v in a.include for p in v.split(",") if p]
+        wanted = [n for n in wanted if n not in excluded]
+        names = resolve(repo, wanted, excluded)
+
+        kernel_names = []
+        if not a.no_kernel:
+            kpkg = a.kernel_package or KERNEL_PACKAGES.get(arch)
+            if not kpkg or kpkg not in repo.packages:
+                die("no kernel package for %s; use --kernel-package or --no-kernel" % arch)
+            # Follow the metapackage to the real image package.  Only that is
+            # unpacked (outside dpkg); initramfs-tools etc. are deliberately skipped.
+            kernel_names = [n for n in resolve(repo, [kpkg], excluded)
+                            if n.startswith("linux-image-") and n != kpkg] or [kpkg]
+        log("selected %d packages%s" % (len(names),
+            " + kernel " + ",".join(kernel_names) if kernel_names else ""))
+        debs = download_all(repo, names + kernel_names, a.cache_dir, a.jobs)
+
+        b.prepare_root()
+        b.install_packages(repo, names, debs)
+        b.install_kernel(repo, kernel_names, debs)
+        b.configure_image(repo)
+        b.trim()
+        raw = du(a.rootfs)
+        b.make_cpio()
+        size = os.path.getsize(a.output)
+        log("unpacked size %.1f MiB, image %s is %.1f MiB"
+            % (raw / 2**20, a.output, size / 2**20))
+        if size > a.max_size:
+            die("image is larger than --max-size (%.1f MiB > %.1f MiB)"
+                % (size / 2**20, a.max_size / 2**20))
+        if raw > a.max_size:
+            log("warning: unpacked image (%.1f MiB) exceeds %.1f MiB; it needs that much RAM"
+                % (raw / 2**20, a.max_size / 2**20))
+        if not b.exec_mode:
+            log("note: packages will be configured by busybox init on each boot")
+    finally:
+        b.cleanup()
+        if not keep_root:
+            shutil.rmtree(a.rootfs, ignore_errors=True)
+        elif os.path.isdir(a.rootfs):
+            log("staging rootfs kept at " + a.rootfs)
+
+
+if __name__ == "__main__":
+    main()
